@@ -95,9 +95,9 @@ const BLOCKLIST = new Set([
   'minero.cc',
   
   // Adult Content (for safe browsing)
-  'pornhub.com',
-  'xvideos.com',
-  'xnxx.com',
+  'rpornhub.com',
+  'rxvideos.com',
+  'rxnxx.com',
 ]);
 
 // Additional patterns to block
