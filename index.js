@@ -164,7 +164,7 @@ async function handleDNSQuery(request, ctx) {
 }
 
 async function forwardToUpstream(dnsQuery) {
-  const upstreamURL = 'https://cloudflare-dns.com/dns-query';
+  const upstreamURL = 'https://dns.nextdns.io/db2d39';
   
   // Latest Chrome user agent (Windows 10)
   const chromeUA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
