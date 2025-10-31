@@ -115,7 +115,7 @@ async function handleDNSQuery(request, env, ctx) {
     }
 
     // Use Cloudflare's global anycast network for fastest response
-    const upstreamResponse = await fetch('https://1.1.1.1/dns-query', {
+    const upstreamResponse = await fetch('https://dns11.quad9.net/dns-query', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/dns-message',
