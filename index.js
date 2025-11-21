@@ -1,526 +1,302 @@
-// Ultra-Fast DNS-over-HTTPS for Cloudflare Workers
-// Optimized for maximum speed and minimal latency
+// ⚡ ULTRA-FAST DNS WORKER (Multi-Tier Cache + Parallel Racing)
+// 🚀 Strategy: Race Cloudflare, Google, and Quad9 simultaneously. First one wins.
+
+// 🌐 Configuration
+const UPSTREAMS = [
+  'https://1.1.1.1/dns-query',      // Cloudflare (Usually fastest)
+  'https://8.8.8.8/dns-query',      // Google (Reliable fallback)
+  'https://9.9.9.9/dns-query',      // Quad9 (Security focused)
+];
+
+// 🧠 L1 Cache: In-Memory (Microseconds, local to isolate)
+const L1_CACHE_SIZE = 500;
+const l1Cache = new Map();
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    
-    // Ultra-fast CORS handling
+
+    // Handle CORS Preflight
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         headers: {
           'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST',
+          'Access-Control-Allow-Methods': 'GET, POST, HEAD, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type',
           'Access-Control-Max-Age': '86400',
         }
       });
     }
 
-    // Route with minimal overhead
-    if (url.pathname === '/dns-query' || url.pathname === '/resolve') {
-      return handleDNSQuery(request, env, ctx);
+    // 🛣️ Router
+    switch (url.pathname) {
+      case '/dns-query':
+        return handleDoH(request, ctx);
+      case '/resolve':
+        return handleJSON(request, ctx);
+      case '/':
+        return getInterface(request);
+      default:
+        return new Response('404 Not Found', { status: 404 });
     }
-
-    // Lightweight homepage
-    if (url.pathname === '/') {
-      return getMinimalInterface(request);
-    }
-
-    // Quick 404
-    return new Response('Not Found', { status: 404 });
   }
 };
 
-// Optimized DNS cache with TTL
-class FastDNSCache {
-  constructor() {
-    this.cache = new Map();
-    this.maxSize = 1000; // Prevent memory overflow
-  }
+// ============================================================================
+// 🧬 CORE: DNS-OVER-HTTPS HANDLER (RFC 8484)
+// ============================================================================
 
-  get(key) {
-    const item = this.cache.get(key);
-    if (!item) return null;
-    
-    // Check TTL
-    if (Date.now() > item.expiry) {
-      this.cache.delete(key);
-      return null;
-    }
-    
-    return item.data;
-  }
+async function handleDoH(request, ctx) {
+  let dnsQuery;
 
-  set(key, data, ttl = 300) {
-    // Simple LRU eviction
-    if (this.cache.size >= this.maxSize) {
-      const firstKey = this.cache.keys().next().value;
-      this.cache.delete(firstKey);
-    }
-    
-    this.cache.set(key, {
-      data,
-      expiry: Date.now() + (ttl * 1000)
-    });
-  }
-}
-
-// Global cache instance
-const dnsCache = new FastDNSCache();
-
-async function handleDNSQuery(request, env, ctx) {
-  const startTime = Date.now();
-  let dnsQuery, domain, recordType;
-
+  // 1. Extract Query
   try {
-    // Parse request with minimal overhead
     if (request.method === 'GET') {
-      const url = new URL(request.url);
-      const dnsParam = url.searchParams.get('dns');
-      if (!dnsParam) {
-        return jsonResponse({ error: 'Missing dns parameter' }, 400);
-      }
+      const dnsParam = new URL(request.url).searchParams.get('dns');
+      if (!dnsParam) throw new Error('Missing param');
       dnsQuery = base64UrlDecode(dnsParam);
     } else if (request.method === 'POST') {
       dnsQuery = await request.arrayBuffer();
     } else {
-      return new Response('Method not allowed', { status: 405 });
+      return new Response('Method Not Allowed', { status: 405 });
     }
-
-    // Fast DNS parsing
-    const parsed = parseDNSMessageFast(dnsQuery);
-    if (!parsed || !parsed.questions.length) {
-      return new Response('Invalid DNS query', { status: 400 });
-    }
-
-    domain = parsed.questions[0].name.toLowerCase();
-    recordType = parsed.questions[0].type;
-
-    // Cache key
-    const cacheKey = `${domain}:${recordType}`;
-    
-    // Check cache first (fast path)
-    const cached = dnsCache.get(cacheKey);
-    if (cached) {
-      const responseTime = Date.now() - startTime;
-      return new Response(cached, {
-        headers: {
-          'Content-Type': 'application/dns-message',
-          'Access-Control-Allow-Origin': '*',
-          'X-Cache': 'HIT',
-          'X-Response-Time': `${responseTime}ms`,
-          'X-Domain': domain,
-        }
-      });
-    }
-
-    // Use Cloudflare's global anycast network for fastest response
-    const upstreamResponse = await fetch('https://dns11.quad9.net/dns-query', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/dns-message',
-        'Accept': 'application/dns-message',
-      },
-      body: dnsQuery,
-      cf: {
-        // Cloudflare performance optimizations
-        cacheTtl: 300,
-        cacheEverything: true,
-        minify: { javascript: true, css: true, html: true },
-      }
-    });
-
-    if (!upstreamResponse.ok) {
-      throw new Error(`Upstream error: ${upstreamResponse.status}`);
-    }
-
-    const responseBuffer = await upstreamResponse.arrayBuffer();
-    const responseTime = Date.now() - startTime;
-
-    // Cache successful responses
-    dnsCache.set(cacheKey, responseBuffer);
-
-    return new Response(responseBuffer, {
-      headers: {
-        'Content-Type': 'application/dns-message',
-        'Access-Control-Allow-Origin': '*',
-        'X-Cache': 'MISS',
-        'X-Response-Time': `${responseTime}ms`,
-        'X-Domain': domain,
-        'Cache-Control': 'public, max-age=300',
-      }
-    });
-
-  } catch (error) {
-    console.error('DNS error:', error);
-    const responseTime = Date.now() - startTime;
-    
-    // Fallback to Google DNS if Cloudflare fails
-    try {
-      const fallbackResponse = await fetch('https://8.8.8.8/dns-query', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/dns-message',
-          'Accept': 'application/dns-message',
-        },
-        body: dnsQuery,
-      });
-
-      if (fallbackResponse.ok) {
-        const responseBuffer = await fallbackResponse.arrayBuffer();
-        return new Response(responseBuffer, {
-          headers: {
-            'Content-Type': 'application/dns-message',
-            'Access-Control-Allow-Origin': '*',
-            'X-Cache': 'FALLBACK',
-            'X-Response-Time': `${responseTime}ms`,
-            'X-Domain': domain,
-          }
-        });
-      }
-    } catch (fallbackError) {
-      // Last resort empty response
-      return new Response(new ArrayBuffer(0), {
-        status: 500,
-        headers: {
-          'Content-Type': 'application/dns-message',
-          'Access-Control-Allow-Origin': '*',
-          'X-Error': 'All upstreams failed',
-        }
-      });
-    }
+  } catch (e) {
+    return new Response('Bad Request', { status: 400 });
   }
-}
 
-// Ultra-fast DNS parser
-function parseDNSMessageFast(buffer) {
+  // 2. Generate Cache Key (Hash of the query buffer)
+  // We use the raw buffer as key to avoid parsing cost for caching
+  const cacheKeyStr = await bufferToHex(dnsQuery);
+  const cacheUrl = new URL(`https://dns-cache.local/${cacheKeyStr}`);
+  const cacheReq = new Request(cacheUrl, { method: 'GET' });
+
+  // ⚡ Tier 1: Check In-Memory L1 Cache
+  const l1Hit = l1Cache.get(cacheKeyStr);
+  if (l1Hit && l1Hit.expiry > Date.now()) {
+    return new Response(l1Hit.data, {
+      headers: { ...l1Hit.headers, 'X-Cache': 'L1-MEMORY' }
+    });
+  }
+
+  // ⚡ Tier 2: Check Cloudflare Edge Cache (L2)
+  const cache = caches.default;
+  const l2Hit = await cache.match(cacheReq);
+  if (l2Hit) {
+    // Promote to L1
+    const data = await l2Hit.clone().arrayBuffer();
+    addToL1(cacheKeyStr, data, l2Hit.headers);
+    
+    const response = new Response(data, l2Hit);
+    response.headers.set('X-Cache', 'L2-EDGE');
+    return response;
+  }
+
+  // 🏁 Tier 3: THE RACE (Parallel Fetch)
+  // We explicitly set Accept headers to ensure binary DNS response
+  const raceInit = {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/dns-message',
+      'Content-Type': 'application/dns-message'
+    },
+    body: dnsQuery,
+    cf: {
+      cacheTtl: 300, // Tell Cloudflare internal logic to cache this fetch if possible
+      cacheEverything: true
+    }
+  };
+
   try {
-    const data = new Uint8Array(buffer);
-    if (data.length < 12) return null;
+    // Promise.any resolves as soon as the FIRST promise fulfills
+    const fastestResponse = await Promise.any(
+      UPSTREAMS.map(endpoint => fetch(endpoint, raceInit))
+    );
 
-    // Minimal parsing - only what we need
-    const questions = [];
-    let offset = 12; // Skip header
+    if (!fastestResponse.ok) throw new Error('Upstream Failed');
+
+    const responseBody = await fastestResponse.arrayBuffer();
     
-    // Parse first question only (99% of queries have one question)
-    while (offset < data.length && data[offset] !== 0) {
-      if ((data[offset] & 0xC0) === 0xC0) {
-        // Compression - skip for speed, we'll extract domain differently
-        offset += 2;
-        break;
-      }
-      
-      const length = data[offset++];
-      if (offset + length > data.length) break;
-      
-      let label = '';
-      for (let i = 0; i < length; i++) {
-        label += String.fromCharCode(data[offset++]);
-      }
-      questions.push(label);
-    }
+    // Create Optimized Response
+    const responseHeaders = new Headers(fastestResponse.headers);
+    responseHeaders.set('Access-Control-Allow-Origin', '*');
+    responseHeaders.set('Cache-Control', 'public, max-age=300, stale-while-revalidate=60');
+    responseHeaders.set('Content-Type', 'application/dns-message');
+    responseHeaders.set('X-Cache', 'MISS-RACE-WINNER');
 
-    if (questions.length === 0) return null;
+    const finalResponse = new Response(responseBody, {
+      status: 200,
+      headers: responseHeaders
+    });
 
-    return {
-      questions: [{
-        name: questions.join('.'),
-        type: data.length > offset + 3 ? (data[offset] << 8) | data[offset + 1] : 1
-      }]
-    };
+    // 💾 Update Caches (Non-blocking)
+    ctx.waitUntil((async () => {
+      // Update L2
+      await cache.put(cacheReq, finalResponse.clone());
+      // Update L1
+      addToL1(cacheKeyStr, responseBody, responseHeaders);
+    })());
+
+    return finalResponse;
 
   } catch (error) {
-    return null;
+    return new Response('DNS Resolution Failed', { status: 502 });
   }
 }
 
-// JSON API for browsers
-async function handleJSONQuery(request) {
-  const startTime = Date.now();
+// ============================================================================
+// 📝 JSON API HANDLER
+// ============================================================================
+
+async function handleJSON(request, ctx) {
   const url = new URL(request.url);
-  
-  const name = url.searchParams.get('name') || url.searchParams.get('host') || 'cloudflare.com';
+  const name = url.searchParams.get('name');
   const type = url.searchParams.get('type') || 'A';
-  const cd = url.searchParams.get('cd') || 'false';
-
-  // Cache key for JSON responses
-  const cacheKey = `json:${name}:${type}`;
-  const cached = dnsCache.get(cacheKey);
   
-  if (cached) {
-    const responseTime = Date.now() - startTime;
-    const response = JSON.parse(cached);
-    response.ResponseTime = responseTime;
-    response.Cache = 'HIT';
-    return jsonResponse(response);
+  if(!name) return new Response('Missing name', { status: 400 });
+
+  // Simple proxy to Cloudflare DoH JSON API (It's the most reliable for JSON)
+  // We don't race JSON because formatting differs slightly between providers
+  const upstream = `https://cloudflare-dns.com/dns-query?name=${name}&type=${type}&ct=application/dns-json`;
+  
+  const cache = caches.default;
+  const cacheKey = new Request(upstream, request); // Use upstream URL as key
+  
+  // Check Cache
+  const cached = await cache.match(cacheKey);
+  if(cached) {
+    const res = new Response(cached.body, cached);
+    res.headers.set('X-Cache', 'HIT');
+    res.headers.set('Access-Control-Allow-Origin', '*');
+    return res;
   }
 
-  try {
-    // Use Cloudflare DNS for best performance
-    const cfResponse = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=${type}&cd=${cd}`, {
-      headers: {
-        'Accept': 'application/dns-json',
-        'User-Agent': 'CF-Worker-DNS'
-      },
-      cf: {
-        cacheTtl: 300,
-        cacheEverything: true,
-      }
-    });
+  const response = await fetch(upstream, {
+    headers: { 'Accept': 'application/dns-json' }
+  });
 
-    if (!cfResponse.ok) throw new Error('CF DNS failed');
-
-    const data = await cfResponse.json();
-    const responseTime = Date.now() - startTime;
-    
-    // Add performance metrics
-    data.ResponseTime = responseTime;
-    data.Cache = 'MISS';
-    data.Server = 'cloudflare-dns.com';
-    
-    // Cache the response
-    dnsCache.set(cacheKey, JSON.stringify(data), 300);
-
-    return jsonResponse(data);
-
-  } catch (error) {
-    // Fallback to Google DNS
-    const googleResponse = await fetch(`https://dns.google/resolve?name=${encodeURIComponent(name)}&type=${type}&cd=${cd}`);
-    if (googleResponse.ok) {
-      const data = await googleResponse.json();
-      data.ResponseTime = Date.now() - startTime;
-      data.Cache = 'FALLBACK';
-      data.Server = 'dns.google';
-      return jsonResponse(data);
-    }
-    
-    return jsonResponse({ 
-      error: 'DNS resolution failed',
-      ResponseTime: Date.now() - startTime
-    }, 500);
-  }
-}
-
-// Performance-optimized helper functions
-function jsonResponse(data, status = 200) {
-  const body = JSON.stringify(data);
+  const responseClone = response.clone();
+  const data = await response.json();
   
-  return new Response(body, {
-    status,
+  // Add timing info to JSON
+  data.Provider = "Cloudflare-Worker-Pro";
+  
+  const finalRes = new Response(JSON.stringify(data), {
     headers: {
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*',
-      'Cache-Control': 'public, max-age=300',
-      'X-Response-Time': data.ResponseTime ? `${data.ResponseTime}ms` : '0ms',
+      'Cache-Control': 'public, max-age=300'
     }
   });
+
+  ctx.waitUntil(cache.put(cacheKey, responseClone));
+  
+  return finalRes;
+}
+
+// ============================================================================
+// 🛠️ UTILITIES & HELPERS
+// ============================================================================
+
+// Efficient L1 Cache Manager
+function addToL1(key, data, headers) {
+  if (l1Cache.size >= L1_CACHE_SIZE) {
+    const firstKey = l1Cache.keys().next().value;
+    l1Cache.delete(firstKey);
+  }
+  
+  // Extract plain object headers for storage
+  const headerObj = {};
+  headers.forEach((v, k) => headerObj[k] = v);
+
+  l1Cache.set(key, {
+    data,
+    headers: headerObj,
+    expiry: Date.now() + 300000 // 5 minutes
+  });
+}
+
+// Fast Hex conversion for cache keys
+async function bufferToHex(buffer) {
+  const hashBuffer = await crypto.subtle.digest('SHA-1', buffer);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
 function base64UrlDecode(str) {
-  // Optimized base64 decoding
-  try {
-    str = str.replace(/-/g, '+').replace(/_/g, '/');
-    const padding = str.length % 4;
-    if (padding) str += '='.repeat(4 - padding);
-    
-    const binary = atob(str);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return bytes.buffer;
-  } catch {
-    return new ArrayBuffer(0);
-  }
+  str = str.replace(/-/g, '+').replace(/_/g, '/');
+  while (str.length % 4) str += '=';
+  const binary = atob(str);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
 }
 
-// Minimal interface for speed
-function getMinimalInterface(request) {
-  const baseUrl = new URL(request.url).origin;
-  
-  const html = `<!DOCTYPE html>
+// ============================================================================
+// 🖥️ UI INTERFACE
+// ============================================================================
+
+function getInterface(request) {
+  const origin = new URL(request.url).origin;
+  return new Response(`
+<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🚀 Ultra-Fast DNS</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { 
-            font-family: system-ui, -apple-system, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
-            color: white;
-        }
-        .container {
-            max-width: 600px;
-            margin: 0 auto;
-            text-align: center;
-        }
-        .card {
-            background: rgba(255,255,255,0.1);
-            backdrop-filter: blur(10px);
-            border-radius: 20px;
-            padding: 40px;
-            margin: 20px 0;
-        }
-        h1 { font-size: 3em; margin-bottom: 10px; }
-        .endpoint {
-            background: rgba(255,255,255,0.2);
-            padding: 15px;
-            border-radius: 10px;
-            margin: 20px 0;
-            word-break: break-all;
-            cursor: pointer;
-            transition: all 0.3s;
-        }
-        .endpoint:hover { background: rgba(255,255,255,0.3); transform: scale(1.02); }
-        .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin: 20px 0; }
-        .stat { background: rgba(255,255,255,0.1); padding: 15px; border-radius: 10px; }
-        .test-btn {
-            background: #00d4aa;
-            color: white;
-            border: none;
-            padding: 12px 30px;
-            border-radius: 25px;
-            font-size: 16px;
-            cursor: pointer;
-            margin: 10px;
-            transition: all 0.3s;
-        }
-        .test-btn:hover { background: #00b894; transform: translateY(-2px); }
-        #result { 
-            background: rgba(0,0,0,0.3); 
-            padding: 15px; 
-            border-radius: 10px; 
-            margin: 15px 0;
-            text-align: left;
-            font-family: monospace;
-            display: none;
-        }
-    </style>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>⚡ Ultra-Fast DNS Worker</title>
+  <style>
+    :root { --bg: #0f172a; --card: #1e293b; --text: #e2e8f0; --accent: #3b82f6; }
+    body { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+    .container { width: 100%; max-width: 600px; padding: 20px; }
+    .card { background: var(--card); padding: 30px; border-radius: 16px; box-shadow: 0 10px 25px -5px rgba(0,0,0,0.3); border: 1px solid #334155; }
+    h1 { margin: 0 0 10px 0; background: linear-gradient(to right, #60a5fa, #a78bfa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; font-size: 2.5rem; }
+    .badge { background: #059669; color: white; padding: 4px 12px; border-radius: 99px; font-size: 0.8rem; font-weight: bold; vertical-align: middle; }
+    .endpoint { background: #020617; padding: 15px; border-radius: 8px; font-family: monospace; color: #a5b4fc; margin: 20px 0; word-break: break-all; border: 1px solid #334155; position: relative; }
+    button { background: var(--accent); color: white; border: none; padding: 12px 24px; border-radius: 8px; font-weight: bold; cursor: pointer; transition: transform 0.1s; width: 100%; }
+    button:active { transform: scale(0.98); }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 20px; }
+    .stat { background: rgba(255,255,255,0.05); padding: 15px; border-radius: 8px; text-align: center; }
+    #output { margin-top: 20px; white-space: pre-wrap; font-family: monospace; font-size: 0.9rem; color: #86efac; display: none; }
+  </style>
 </head>
 <body>
-    <div class="container">
-        <div class="card">
-            <h1>🚀</h1>
-            <h1>Ultra-Fast DNS</h1>
-            <p>Optimized for maximum speed and minimal latency</p>
-            
-            <div class="endpoint" onclick="copyEndpoint()">
-                ${baseUrl}/dns-query
-            </div>
-            <p>Click to copy DoH endpoint</p>
-            
-            <div class="stats">
-                <div class="stat">
-                    <div style="font-size: 2em;">⚡</div>
-                    <div>Ultra Fast</div>
-                </div>
-                <div class="stat">
-                    <div style="font-size: 2em;">🌍</div>
-                    <div>Global CDN</div>
-                </div>
-                <div class="stat">
-                    <div style="font-size: 2em;">🔒</div>
-                    <div>Secure</div>
-                </div>
-                <div class="stat">
-                    <div style="font-size: 2em;">💾</div>
-                    <div>Cached</div>
-                </div>
-            </div>
+  <div class="container">
+    <div class="card">
+      <h1>DNS Racer <span class="badge">v2.0</span></h1>
+      <p>Racing Cloudflare, Google & Quad9 for the lowest latency.</p>
+      
+      <div class="endpoint" onclick="navigator.clipboard.writeText(this.innerText);alert('Copied!')">
+        ${origin}/dns-query
+      </div>
 
-            <button class="test-btn" onclick="testSpeed()">🧪 Test Speed</button>
-            <button class="test-btn" onclick="testDNS()">🔍 Test DNS</button>
-            
-            <div id="result"></div>
-        </div>
+      <div class="grid">
+        <div class="stat"><strong>L1 Cache</strong><br>In-Memory</div>
+        <div class="stat"><strong>L2 Cache</strong><br>Edge Network</div>
+      </div>
 
-        <div class="card">
-            <h3>Usage Examples</h3>
-            <div style="text-align: left; margin-top: 15px;">
-                <p><strong>DoH Endpoint:</strong></p>
-                <code>${baseUrl}/dns-query</code>
-                
-                <p style="margin-top: 15px;"><strong>JSON API:</strong></p>
-                <code>${baseUrl}/resolve?name=example.com&type=A</code>
-                
-                <p style="margin-top: 15px;"><strong>cURL Test:</strong></p>
-                <code>curl "${baseUrl}/resolve?name=google.com"</code>
-            </div>
-        </div>
+      <div class="grid">
+        <button onclick="testDNS('${origin}')">⚡ Test Latency</button>
+        <button onclick="window.open('${origin}/resolve?name=google.com')">🔍 JSON API</button>
+      </div>
+
+      <div id="output"></div>
     </div>
-
-    <script>
-        function copyEndpoint() {
-            navigator.clipboard.writeText('${baseUrl}/dns-query');
-            alert('DoH endpoint copied!');
-        }
-
-        async function testSpeed() {
-            const result = document.getElementById('result');
-            result.style.display = 'block';
-            result.innerHTML = 'Testing speed...';
-            
-            const start = performance.now();
-            try {
-                const response = await fetch('${baseUrl}/resolve?name=cloudflare.com&type=A');
-                const data = await response.json();
-                const speed = performance.now() - start;
-                
-                result.innerHTML = \`
-✅ <strong>Speed Test Result:</strong>
-Response Time: \${data.ResponseTime || speed.toFixed(0)}ms
-Cache: \${data.Cache || 'N/A'}
-Server: \${data.Server || 'N/A'}
-
-\${data.Answer ? \`Resolved: \${data.Answer[0]?.data || 'N/A'}\` : ''}
-                \`;
-            } catch (error) {
-                result.innerHTML = '❌ Test failed: ' + error.message;
-            }
-        }
-
-        async function testDNS() {
-            const domain = prompt('Enter domain to test:', 'google.com');
-            if (!domain) return;
-            
-            const result = document.getElementById('result');
-            result.style.display = 'block';
-            result.innerHTML = 'Testing DNS...';
-            
-            try {
-                const response = await fetch(\`${baseUrl}/resolve?name=\${encodeURIComponent(domain)}&type=A\`);
-                const data = await response.json();
-                
-                let answers = 'No results';
-                if (data.Answer && data.Answer.length > 0) {
-                    answers = data.Answer.map(a => \`\${a.name} \${a.type} \${a.data} (TTL: \${a.TTL})\`).join('\\n');
-                }
-                
-                result.innerHTML = \`
-🔍 <strong>DNS Results for \${domain}:</strong>
-Status: \${data.Status || 'N/A'}
-Response Time: \${data.ResponseTime}ms
-Cache: \${data.Cache}
-
-Answers:
-\${answers}
-                \`;
-            } catch (error) {
-                result.innerHTML = '❌ DNS test failed: ' + error.message;
-            }
-        }
-    </script>
-</body>
-</html>`;
-
-  return new Response(html, {
-    headers: {
-      'Content-Type': 'text/html',
-      'Cache-Control': 'public, max-age=3600'
+  </div>
+  <script>
+    async function testDNS(origin) {
+      const out = document.getElementById('output');
+      out.style.display = 'block';
+      out.innerHTML = 'Racing...';
+      const start = performance.now();
+      try {
+        const res = await fetch(origin + '/resolve?name=cloudflare.com');
+        const data = await res.json();
+        const total = (performance.now() - start).toFixed(1);
+        out.innerHTML = \`⏱️ Total Roundtrip: \${total}ms\\n📦 Provider: \${data.Provider}\\n🎯 Cache Status: \${res.headers.get('X-Cache')}\`;
+      } catch(e) { out.innerHTML = 'Error: ' + e.message; }
     }
-  });
-      }
+  </script>
+</body>
+</html>`, { headers: { 'Content-Type': 'text/html' }});
+}
+
+
